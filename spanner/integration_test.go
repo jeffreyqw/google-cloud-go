@@ -30,19 +30,15 @@ import (
 	"testing"
 	"time"
 
-	"io/ioutil"
-
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/internal/testutil"
 	"cloud.google.com/go/internal/uid"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
-	spanner "cloud.google.com/go/spanner/apiv1"
-	"golang.org/x/oauth2/google"
-	iam "google.golang.org/api/iam/v1"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -2074,176 +2070,180 @@ func TestIntegration_PDML(t *testing.T) {
 	}
 }
 
-//Test credential for VM's default account
-func TestIntegration_ComputeEngineCredsWithDefaultServiceAccount(t *testing.T) {
-
+func TestBatchDML(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	opts := option.WithTokenSource(google.ComputeTokenSource(""))
+	client, _, cleanup := prepareIntegrationTest(ctx, t, singerDBStatements)
+	defer cleanup()
 
-	client, err := spanner.NewClient(ctx, opts)
+	columns := []string{"SingerId", "FirstName", "LastName"}
+
+	// Populate the Singers table.
+	var muts []*Mutation
+	for _, row := range [][]interface{}{
+		{1, "Umm", "Kulthum"},
+		{2, "Eduard", "Khil"},
+		{3, "Audra", "McDonald"},
+	} {
+		muts = append(muts, Insert("Singers", columns, row))
+	}
+	if _, err := client.Apply(ctx, muts); err != nil {
+		t.Fatal(err)
+	}
+
+	var counts []int64
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		counts, err = tx.BatchUpdate(ctx, []Statement{
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 1" WHERE Singers.SingerId = 1`},
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 2" WHERE Singers.SingerId = 2`},
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 3" WHERE Singers.SingerId = 3`},
+		})
+		return err
+	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.SetGoogleClientInfo() //test spanner client api or connection
+	if want := []int64{1, 1, 1}; !testEqual(counts, want) {
+		t.Fatalf("got %d, want %d", counts, want)
+	}
+	got, err := readAll(client.Single().Read(ctx, "Singers", AllKeys(), columns))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]interface{}{
+		{int64(1), "changed 1", "Kulthum"},
+		{int64(2), "changed 2", "Khil"},
+		{int64(3), "changed 3", "McDonald"},
+	}
+	if !testEqual(got, want) {
+		t.Errorf("\ngot %v\nwant%v", got, want)
+	}
 }
 
-//Test credential for VM's service account
-func TestIntegration_ComputeEngineCredsWithServiceAccount(t *testing.T) {
+func TestBatchDML_NoStatements(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	name := "dummyaccount"
-	account, err := createServiceAccount(testProjectID, name, "Test")
-	if err != nil {
-		t.Fatalf("createServiceAccount:%v", err)
+	client, _, cleanup := prepareIntegrationTest(ctx, t, singerDBStatements)
+	defer cleanup()
+
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		_, err = tx.BatchUpdate(ctx, []Statement{})
+		return err
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
-	opts := option.WithTokenSource(google.ComputeTokenSource(account.Email))
-	client, err := spanner.NewClient(ctx, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.Connection()
-	err = deleteServiceAccount(account.Email)
-	if err != nil {
-		t.Fatal(err)
+	if s, ok := status.FromError(err); ok {
+		if s.Code() != codes.InvalidArgument {
+			t.Fatalf("expected InvalidArgument, got %v", err)
+		}
+	} else {
+		t.Fatalf("expected InvalidArgument, got %v", err)
 	}
 }
 
-//Test JWT key file credential for VM's Defaul service account
-func TestIntegration_JWTDefaultServiceAccount(t *testing.T) {
+func TestBatchDML_TwoStatements(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	jsonFile, err := os.Open("/Users/qw/Desktop/cloudprober-test-312fec66d8c5.json")
+	client, _, cleanup := prepareIntegrationTest(ctx, t, singerDBStatements)
+	defer cleanup()
+
+	columns := []string{"SingerId", "FirstName", "LastName"}
+
+	// Populate the Singers table.
+	var muts []*Mutation
+	for _, row := range [][]interface{}{
+		{1, "Umm", "Kulthum"},
+		{2, "Eduard", "Khil"},
+		{3, "Audra", "McDonald"},
+	} {
+		muts = append(muts, Insert("Singers", columns, row))
+	}
+	if _, err := client.Apply(ctx, muts); err != nil {
+		t.Fatal(err)
+	}
+
+	var updateCount int64
+	var batchCounts []int64
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		batchCounts, err = tx.BatchUpdate(ctx, []Statement{
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 1" WHERE Singers.SingerId = 1`},
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 2" WHERE Singers.SingerId = 2`},
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 3" WHERE Singers.SingerId = 3`},
+		})
+		if err != nil {
+			return err
+		}
+
+		updateCount, err = tx.Update(ctx, Statement{SQL: `UPDATE Singers SET Singers.FirstName = "changed 1" WHERE Singers.SingerId = 1`})
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	jsonKey, _ := ioutil.ReadAll(jsonFile)
-	creds, err := google.JWTAccessTokenSourceFromJSON(jsonKey, "")
-	opts := option.WithTokenSource(creds)
-	client, err := spanner.NewClient(ctx, opts)
-	if err != nil {
-		t.Fatal(err)
+	if want := []int64{1, 1, 1}; !testEqual(batchCounts, want) {
+		t.Fatalf("got %d, want %d", batchCounts, want)
 	}
-	client.Connection()
+	if updateCount != 1 {
+		t.Fatalf("got %v, want 1", updateCount)
+	}
 }
 
-//Test JWT key file credential for VM's service account
-func TestIntegration_JWTServiceAccount(t *testing.T) {
+// TODO(deklerk) this currently does not work because the transaction appears to
+// get rolled back after a single statement fails. b/120158761
+func TestBatchDML_Error(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	name := "dummyjwt"
-	account, err := createServiceAccount(testProjectID, name, "JWTTEst")
-	if err != nil {
-		t.Fatalf("createServiceAccount:%v", err)
-	}
+	client, _, cleanup := prepareIntegrationTest(ctx, t, singerDBStatements)
+	defer cleanup()
 
-	key, err := createKey(account.Email)
-	if err != nil {
-		deleteServiceAccount(account.Email)
-		t.Fatalf("createKey:%v", err)
-	}
+	columns := []string{"SingerId", "FirstName", "LastName"}
 
-	jsonKey, err := key.MarshalJSON()
-	if err != nil {
-		t.Fatalf("MarshalJSON:%v", err)
+	// Populate the Singers table.
+	var muts []*Mutation
+	for _, row := range [][]interface{}{
+		{1, "Umm", "Kulthum"},
+		{2, "Eduard", "Khil"},
+		{3, "Audra", "McDonald"},
+	} {
+		muts = append(muts, Insert("Singers", columns, row))
 	}
-
-	creds, err := google.JWTAccessTokenSourceFromJSON(jsonKey, "")
-	opts := option.WithTokenSource(creds)
-	client, err := spanner.NewClient(ctx, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.SetGoogleClientInfo()
-
-	err = deleteKey(key.Name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = deleteServiceAccount(account.Email)
-	if err != nil {
+	if _, err := client.Apply(ctx, muts); err != nil {
 		t.Fatal(err)
 	}
 
-}
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		counts, err := tx.BatchUpdate(ctx, []Statement{
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 1" WHERE Singers.SingerId = 1`},
+			{SQL: `some illegal statement`},
+			{SQL: `UPDATE Singers SET Singers.FirstName = "changed 3" WHERE Singers.SingerId = 3`},
+		})
+		if err == nil {
+			t.Fatal("expected err, got nil")
+		}
+		if want := []int64{1}; !testEqual(counts, want) {
+			t.Fatalf("got %d, want %d", counts, want)
+		}
 
-////CreateServiceAccount
-func createServiceAccount(projectID, name, displayName string) (*iam.ServiceAccount, error) {
-	client, err := google.DefaultClient(context.Background(), iam.CloudPlatformScope)
-	if err != nil {
-		return nil, fmt.Errorf("google.DefaultClient: %v", err)
-	}
-	service, err := iam.New(client)
-	if err != nil {
-		return nil, fmt.Errorf("iam.New: %v", err)
-	}
+		got, err := readAll(tx.Read(ctx, "Singers", AllKeys(), columns))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := [][]interface{}{
+			{int64(1), "changed 1", "Kulthum"},
+			{int64(2), "Eduard", "Khil"},
+			{int64(3), "Audra", "McDonald"},
+		}
+		if !testEqual(got, want) {
+			t.Errorf("\ngot %v\nwant%v", got, want)
+		}
 
-	request := &iam.CreateServiceAccountRequest{
-		AccountId: name,
-		ServiceAccount: &iam.ServiceAccount{
-			DisplayName: displayName,
-		},
-	}
-
-	account, err := service.Projects.ServiceAccounts.Create("projects/"+projectID, request).Do()
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("Projects.ServiceAccounts.Create: %v", err)
+		t.Fatal(err)
 	}
-	return account, nil
-}
-
-// DeleteServiceAccount
-func deleteServiceAccount(email string) error {
-	client, err := google.DefaultClient(context.Background(), iam.CloudPlatformScope)
-	if err != nil {
-		return fmt.Errorf("google.DefaultClient: %v", err)
-	}
-	service, err := iam.New(client)
-	if err != nil {
-		return fmt.Errorf("iam.New: %v", err)
-	}
-
-	_, err = service.Projects.ServiceAccounts.Delete("projects/-/serviceAccounts/" + email).Do()
-	if err != nil {
-		return fmt.Errorf("Projects.ServiceAccounts.Delete: %v", err)
-	}
-	return nil
-}
-
-//createKey
-func createKey(Email string) (*iam.ServiceAccountKey, error) {
-	client, err := google.DefaultClient(context.Background(), iam.CloudPlatformScope)
-	if err != nil {
-		return nil, fmt.Errorf("google.DefaultClient: %v", err)
-	}
-	service, err := iam.New(client)
-	if err != nil {
-		return nil, fmt.Errorf("google.DefaultClient: %v", err)
-	}
-	resource := ("projects/-/serviceAccounts/" + Email)
-	request := &iam.CreateServiceAccountKeyRequest{}
-	key, err := service.Projects.ServiceAccounts.Keys.Create(resource, request).Do()
-	if err != nil {
-		return nil, fmt.Errorf("Projects.ServiceAccounts.Keys.Create: %v", err)
-	}
-	return key, nil
-}
-
-///delete key  not passing any call
-func deleteKey(keyName string) error {
-	client, err := google.DefaultClient(context.Background(), iam.CloudPlatformScope)
-	if err != nil {
-		return fmt.Errorf("google.DefaultClient: %v", err)
-	}
-	service, err := iam.New(client)
-	if err != nil {
-		return fmt.Errorf("iam.New: %v", err)
-	}
-	_, err = service.Projects.ServiceAccounts.Keys.Delete(keyName).Do()
-	if err != nil {
-		return fmt.Errorf("Projects.ServiceAccounts.Keys.Delete: %v", err)
-	}
-	return nil
 }
 
 // Prepare initializes Cloud Spanner testing DB and clients.
